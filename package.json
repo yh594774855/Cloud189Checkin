@@ -6,6 +6,7 @@
   "scripts": {
     "start": "node --unhandled-rejections=strict ./src/app.js",
     "checkin": "node checkin-daemon.js once",
+    "ql": "node checkin-daemon.js once",
     "daemon": "node checkin-daemon.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },

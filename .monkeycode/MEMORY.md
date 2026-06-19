@@ -48,3 +48,13 @@ Agent 在任务执行过程中发现的条目应遵循以下格式：
   - 原始签到入口: `npm start`（src/app.js，功能类似但无定期调度）
   - Token 缓存目录: `.token/`（已加入 .gitignore）
   - 账号配置: `.env`（已加入 .gitignore），格式为 TY_USERNAME_1 / TY_PASSWORD_1
+
+### 青龙签到入口
+- Date: 2026-06-19
+- Context: Agent 在整理青龙面板可运行的签到脚本时发现
+- Category: 工作流协作
+- Instructions:
+  - 青龙面板优先调用 `npm run ql`，其行为等同于 `node checkin-daemon.js once`
+  - 登录顺序通过环境变量 `CLOUD189_LOGIN_PRIORITY` 或 `LOGIN_PRIORITY` 控制，默认值为 `token,refresh,password,qr`
+  - `token` 命中后优先直连签到，`refresh` 负责刷新过期前 token，`password` 和 `qr` 作为兜底登录方式
+  - 任一账号失败后先推送失败消息，再停止脚本，避免继续执行后续账号

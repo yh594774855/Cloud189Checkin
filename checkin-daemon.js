@@ -2,229 +2,395 @@ require("dotenv").config();
 
 const fs = require("fs");
 const path = require("path");
+const got = require("got");
+const tough = require("tough-cookie");
+const QRCode = require("qrcode");
 const {
+  CloudAuthClient,
   CloudClient,
   FileTokenStore,
+  logger: sdkLogger,
 } = require("cloud189-sdk");
+const {
+  WEB_URL,
+  AUTH_URL,
+  API_URL,
+  AppID,
+  ClientType,
+  ReturnURL,
+  UserAgent,
+  clientSuffix,
+} = require("cloud189-sdk/dist/const");
 const accounts = require("./accounts");
 const push = require("./src/push");
+const { delay, mask } = require("./src/utils");
 
 const TOKEN_DIR = path.join(__dirname, ".token");
+const LOGIN_PRIORITY = parsePriority(
+  process.env.CLOUD189_LOGIN_PRIORITY || process.env.LOGIN_PRIORITY || "token,refresh,password,qr"
+);
+const ENABLE_QR_LOGIN = process.env.CLOUD189_ENABLE_QR !== "0";
+const REFRESH_THRESHOLD_MS =
+  Number(process.env.CLOUD189_REFRESH_THRESHOLD_HOURS || 24) * 60 * 60 * 1000;
+const QR_POLL_INTERVAL_MS = Number(process.env.CLOUD189_QR_POLL_INTERVAL_MS || 2000);
+const QR_POLL_LIMIT = Number(process.env.CLOUD189_QR_POLL_LIMIT || 180);
 
-// ---------- GH Actions 首次运行: 从 Secret 初始化 token ----------
-function seedTokenFromEnv(userName) {
-  const tokenPath = path.join(TOKEN_DIR, `${userName}.json`);
-  if (!fs.existsSync(tokenPath) && process.env.CLOUD189_TOKEN) {
-    fs.mkdirSync(TOKEN_DIR, { recursive: true });
-    fs.writeFileSync(tokenPath, process.env.CLOUD189_TOKEN, "utf-8");
-    console.log(`[${mask(userName, 3, 7)}] 从 CLOUD189_TOKEN 初始化缓存`);
+sdkLogger.configure({
+  isDebugEnabled: process.env.CLOUD189_VERBOSE === "1",
+});
+
+function parsePriority(value) {
+  return value
+    .split(",")
+    .map((item) => item.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+function tokenPathOf(userName) {
+  return path.join(TOKEN_DIR, `${userName}.json`);
+}
+
+function readTokenSnapshot(tokenPath) {
+  try {
+    if (!fs.existsSync(tokenPath)) {
+      return null;
+    }
+    const content = fs.readFileSync(tokenPath, "utf-8").trim();
+    if (!content) {
+      return null;
+    }
+    return JSON.parse(content);
+  } catch (error) {
+    throw new Error(`读取 token 失败: ${error.message}`);
   }
 }
 
-// ---------- 工具函数 ----------
-function mask(str, head, tail) {
-  if (!str) return "***";
-  if (str.length <= head + tail) return str;
-  return str.substring(0, head) + "****" + str.substring(str.length - tail);
+function seedTokenFromEnv(tokenPath) {
+  if (fs.existsSync(tokenPath) || !process.env.CLOUD189_TOKEN) {
+    return;
+  }
+  fs.mkdirSync(path.dirname(tokenPath), { recursive: true });
+  fs.writeFileSync(tokenPath, process.env.CLOUD189_TOKEN, "utf-8");
 }
 
-function randomDelay() {
-  const ms = (Math.floor(Math.random() * 91) + 10) * 1000;
-  return ms;
+async function saveSessionToken(tokenStore, session, expiresInMs) {
+  await tokenStore.update({
+    accessToken: session.accessToken,
+    refreshToken: session.refreshToken,
+    expiresIn: Date.now() + expiresInMs,
+  });
 }
 
-// ---------- 签到逻辑 ----------
-async function doCheckIn(account) {
-  const { userName, password } = account;
-  const userNameInfo = mask(userName, 3, 7);
+function buildCheckDate() {
+  const now = new Date();
+  const pad = (value, length = 2) => String(value).padStart(length, "0");
+  return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}.${pad(now.getMilliseconds(), 3)}`;
+}
+
+function createAuthRequest() {
+  return got.extend({
+    headers: { "User-Agent": UserAgent },
+    cookieJar: new tough.CookieJar(),
+    throwHttpErrors: false,
+  });
+}
+
+function createQrQrClient() {
+  return new CloudAuthClient();
+}
+
+function isExpiringSoon(tokenInfo) {
+  return Boolean(tokenInfo?.expiresIn && tokenInfo.expiresIn - Date.now() <= REFRESH_THRESHOLD_MS);
+}
+
+function isTokenValid(tokenInfo) {
+  return Boolean(tokenInfo?.accessToken && tokenInfo?.expiresIn && tokenInfo.expiresIn > Date.now());
+}
+
+async function loginByPassword(authClient, tokenStore, account) {
+  if (!account.userName || !account.password) {
+    throw new Error("未配置账号密码");
+  }
+  const session = await authClient.loginByPassword(account.userName, account.password);
+  await saveSessionToken(tokenStore, session, 6 * 24 * 60 * 60 * 1000);
+  return session;
+}
+
+async function loginByQr(authClient, tokenStore, account) {
+  const request = authClient.authRequest;
+  const loginForm = await request
+    .get(`${WEB_URL}/api/portal/unifyLoginForPC.action`, {
+      searchParams: {
+        appId: AppID,
+        clientType: ClientType,
+        returnURL: ReturnURL,
+        timeStamp: Date.now(),
+      },
+    })
+    .text();
+
+  const reqId = loginForm.match(/reqId = "(.+?)"/)?.[1];
+  const lt = loginForm.match(/lt = "(.+?)"/)?.[1];
+  const paramId = loginForm.match(/paramId = "(.+?)"/)?.[1];
+  if (!reqId || !lt || !paramId) {
+    throw new Error("获取二维码登录参数失败");
+  }
+
+  const uuidRes = await request.post(`${AUTH_URL}/api/logbox/oauth2/getUUID.do`, {
+    headers: { Referer: AUTH_URL },
+    form: { appId: AppID },
+  });
+  const uuidData = JSON.parse(uuidRes.body);
+  if (!uuidData.uuid || !uuidData.encryuuid) {
+    throw new Error(`获取二维码失败: ${uuidRes.body}`);
+  }
+
+  const qrText = await QRCode.toString(uuidData.uuid, {
+    type: "terminal",
+    small: true,
+  });
+  console.log(`\n[${mask(account.userName, 3, 7)}] 请扫码登录\n${qrText}`);
+
+  const qrStateRequest = createAuthRequest();
+  let lastStatus = "waiting";
+
+  for (let count = 0; count < QR_POLL_LIMIT; count += 1) {
+    const res = await qrStateRequest.post(
+      `${AUTH_URL}/api/logbox/oauth2/qrcodeLoginState.do`,
+      {
+        headers: {
+          Referer: AUTH_URL,
+          Reqid: reqId,
+          lt,
+        },
+        form: {
+          appId: AppID,
+          clientType: ClientType,
+          returnUrl: ReturnURL,
+          paramId,
+          uuid: uuidData.uuid,
+          encryuuid: uuidData.encryuuid,
+          date: buildCheckDate(),
+          timeStamp: Date.now(),
+        },
+      }
+    );
+
+    const data = JSON.parse(res.body);
+    if (data.status === 0) {
+      const redirectURL = data.redirectUrl || data.redirectURL || data.toUrl;
+      if (!redirectURL) {
+        throw new Error("二维码已确认但缺少跳转地址");
+      }
+      const session = await authClient.getSessionForPC({ redirectURL });
+      await saveSessionToken(tokenStore, session, 6 * 24 * 60 * 60 * 1000);
+      return session;
+    }
+
+    if (data.status === -11001) {
+      throw new Error("二维码已过期，请重新获取");
+    }
+
+    if (data.status === -11002) {
+      lastStatus = "scanned";
+      console.log(`[${mask(account.userName, 3, 7)}] 已扫码，等待手机确认`);
+    }
+
+    await delay(QR_POLL_INTERVAL_MS);
+  }
+
+  throw new Error(`二维码登录超时，最后状态: ${lastStatus}`);
+}
+
+async function loginByAccessToken(authClient, tokenStore, tokenInfo) {
+  const session = await authClient.loginByAccessToken(tokenInfo.accessToken);
+  await tokenStore.update({
+    accessToken: tokenInfo.accessToken,
+    refreshToken: tokenInfo.refreshToken,
+    expiresIn: tokenInfo.expiresIn,
+  });
+  return session;
+}
+
+async function refreshToken(authClient, tokenStore, tokenInfo) {
+  if (!tokenInfo?.refreshToken) {
+    throw new Error("缺少 refreshToken");
+  }
+  const refreshed = await authClient.refreshToken(tokenInfo.refreshToken);
+  await tokenStore.update({
+    accessToken: refreshed.accessToken,
+    refreshToken: refreshed.refreshToken,
+    expiresIn: Date.now() + refreshed.expiresIn * 1000,
+  });
+  return refreshed;
+}
+
+async function resolveSession(account) {
+  const tokenPath = tokenPathOf(account.userName);
+  seedTokenFromEnv(tokenPath);
+
+  const tokenStore = new FileTokenStore(tokenPath);
+  const tokenInfo = readTokenSnapshot(tokenPath) || tokenStore.get();
+  const authClient = createQrQrClient();
+
+  for (const method of LOGIN_PRIORITY) {
+    if (method === "token") {
+      if (!isTokenValid(tokenInfo)) {
+        continue;
+      }
+      if (isExpiringSoon(tokenInfo) && LOGIN_PRIORITY.includes("refresh")) {
+        continue;
+      }
+      try {
+        const session = await loginByAccessToken(authClient, tokenStore, tokenInfo);
+        return { session, tokenStore, method: "token" };
+      } catch (error) {
+        console.log(`[${mask(account.userName, 3, 7)}] token 登录失败: ${error.message}`);
+      }
+      continue;
+    }
+
+    if (method === "refresh") {
+      if (!tokenInfo?.refreshToken) {
+        continue;
+      }
+      try {
+        const refreshed = await refreshToken(authClient, tokenStore, tokenInfo);
+        const session = await authClient.loginByAccessToken(refreshed.accessToken);
+        return { session, tokenStore, method: "refresh" };
+      } catch (error) {
+        console.log(`[${mask(account.userName, 3, 7)}] refresh 失败: ${error.message}`);
+      }
+      continue;
+    }
+
+    if (method === "password") {
+      try {
+        const session = await loginByPassword(authClient, tokenStore, account);
+        return { session, tokenStore, method: "password" };
+      } catch (error) {
+        console.log(`[${mask(account.userName, 3, 7)}] password 登录失败: ${error.message}`);
+      }
+      continue;
+    }
+
+    if (method === "qr") {
+      if (!ENABLE_QR_LOGIN) {
+        continue;
+      }
+      try {
+        const session = await loginByQr(authClient, tokenStore, account);
+        return { session, tokenStore, method: "qr" };
+      } catch (error) {
+        console.log(`[${mask(account.userName, 3, 7)}] qr 登录失败: ${error.message}`);
+      }
+      continue;
+    }
+  }
+
+  throw new Error("所有登录方式都失败");
+}
+
+function explainQrPolicy() {
+  return `二维码登录: ${ENABLE_QR_LOGIN ? "开启" : "关闭"} | 轮询间隔: ${Math.round(QR_POLL_INTERVAL_MS / 1000)}s | 轮询上限: ${QR_POLL_LIMIT}`;
+}
+
+async function runCheckIn(account) {
+  const before = Date.now();
+  const userNameInfo = mask(account.userName, 3, 7);
   const messages = [];
 
-  seedTokenFromEnv(userName);
-
-  const tokenPath = path.join(TOKEN_DIR, `${userName}.json`);
-  const cloudClient = new CloudClient({
-    username: userName,
-    password,
-    token: new FileTokenStore(tokenPath),
-  });
-
-  const before = Date.now();
   try {
-    // 获取签到前容量
-    const beforeInfo = await cloudClient.getUserSizeInfo();
+    console.log(`[${userNameInfo}] 开始处理登录`);
+    console.log(`[${userNameInfo}] ${explainQrPolicy()}`);
+    const { tokenStore, method } = await resolveSession(account);
+    console.log(`[${userNameInfo}] 登录完成，使用方式: ${method}`);
 
-    // 执行签到
+    const cloudClient = new CloudClient({ token: tokenStore });
+    const beforeInfo = await cloudClient.getUserSizeInfo();
     const signResult = await cloudClient.userSign();
     const bonus = signResult.isSign ? 0 : signResult.netdiskBonus;
-    messages.push(`签到成功: +${bonus}M`);
-
-    // 获取签到后容量
     const afterInfo = await cloudClient.getUserSizeInfo();
-    const personalAdded = (
-      (afterInfo.cloudCapacityInfo.totalSize -
-        beforeInfo.cloudCapacityInfo.totalSize) /
-      1024 /
-      1024
-    ).toFixed(2);
-    const personalTotal = (
-      afterInfo.cloudCapacityInfo.totalSize /
-      1024 /
-      1024 /
-      1024
-    ).toFixed(2);
 
-    messages.push(`个人容量: +${personalAdded}M / ${personalTotal}G`);
+    messages.push(`登录方式: ${method}`);
+    messages.push(`签到结果: +${bonus}M`);
+    messages.push(
+      `个人容量: +${((afterInfo.cloudCapacityInfo.totalSize - beforeInfo.cloudCapacityInfo.totalSize) / 1024 / 1024).toFixed(2)}M / ${(afterInfo.cloudCapacityInfo.totalSize / 1024 / 1024 / 1024).toFixed(2)}G`
+    );
 
-    // 家庭容量（如有变化）
     try {
       const familyAdded = (
-        (afterInfo.familyCapacityInfo.totalSize -
-          beforeInfo.familyCapacityInfo.totalSize) /
+        (afterInfo.familyCapacityInfo.totalSize - beforeInfo.familyCapacityInfo.totalSize) /
         1024 /
         1024
       ).toFixed(2);
-      const familyTotal = (
-        afterInfo.familyCapacityInfo.totalSize /
-        1024 /
-        1024 /
-        1024
-      ).toFixed(2);
-      if (parseFloat(familyAdded) > 0) {
-        messages.push(`家庭容量: +${familyAdded}M / ${familyTotal}G`);
+      if (Number(familyAdded) > 0) {
+        messages.push(
+          `家庭容量: +${familyAdded}M / ${(afterInfo.familyCapacityInfo.totalSize / 1024 / 1024 / 1024).toFixed(2)}G`
+        );
       }
-    } catch (_) {
-      // 无家庭空间
-    }
+    } catch (_) {}
 
-    const elapsed = ((Date.now() - before) / 1000).toFixed(1);
-    messages.push(`耗时: ${elapsed}s`);
+    messages.push(`耗时: ${((Date.now() - before) / 1000).toFixed(1)}s`);
     return { success: true, userNameInfo, messages };
-  } catch (e) {
-    const elapsed = ((Date.now() - before) / 1000).toFixed(1);
-    let errMsg = e.message || String(e);
-    if (e.response) {
-      try {
-        const body = JSON.parse(e.response.body);
-        errMsg = body.msg || body.errorMsg || errMsg;
-      } catch (_) {}
-    }
-    messages.push(`失败: ${errMsg}`);
-    messages.push(`耗时: ${elapsed}s`);
-    return { success: false, userNameInfo, messages };
+  } catch (error) {
+    messages.push(`失败: ${error.message}`);
+    messages.push(`耗时: ${((Date.now() - before) / 1000).toFixed(1)}s`);
+    return { success: false, userNameInfo, messages, error: error.message };
   }
 }
 
-// ---------- 执行所有账号签到 ----------
-async function runAllCheckins() {
-  const results = [];
-  for (const account of accounts) {
-    const startMsg = `[${mask(account.userName, 3, 7)}] 开始签到`;
-    console.log(startMsg);
-    const result = await doCheckIn(account);
-    results.push(result);
-    console.log(result.messages.join(" | "));
-  }
-  return results;
-}
-
-// ---------- 构建推送消息 ----------
 function buildPushMessage(results) {
   const now = new Date().toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" });
   const lines = [`天翼云盘签到 ${now}`, ""];
 
-  for (const r of results) {
-    lines.push(`账号: ${r.userNameInfo}`);
-    for (const m of r.messages) {
-      lines.push(`  ${m}`);
+  for (const result of results) {
+    lines.push(`账号: ${result.userNameInfo}`);
+    for (const message of result.messages) {
+      lines.push(`  ${message}`);
     }
     lines.push("");
   }
+
   return lines.join("\n");
 }
 
-// ---------- 单次签到执行 ----------
-async function doDailyCheckin() {
-  console.log(`\n${"=".repeat(40)}`);
-  console.log(`[${new Date().toISOString()}] 开始执行签到任务`);
-  const results = await runAllCheckins();
-
-  const msg = buildPushMessage(results);
-  console.log(msg);
-
-  // 推送通知
-  const title = "天翼云盘签到";
-  push(title, msg);
-
-  return results;
+async function notifyAndStop(title, content, exitCode = 1) {
+  push(title, content);
+  await delay(1200);
+  process.exit(exitCode);
 }
 
-// ---------- 启动模式 ----------
 async function main() {
-  const mode = process.argv[2];
-
-  if (mode === "once") {
-    // 立即执行一次
-    await doDailyCheckin();
-    process.exit(0);
+  if (!accounts.length) {
+    await notifyAndStop("天翼云盘签到失败", "未配置任何账号", 1);
+    return;
   }
 
-  // 定时模式：每天早上 9:00 (北京时间) + 随机延迟 10~100 秒
-  console.log("签到守护进程已启动");
-  console.log("定时规则: 每天北京时间 9:00 AM + 随机延迟 10~100 秒");
-
-  function scheduleNext() {
-    const now = new Date();
-
-    // 获取当前北京时间
-    const beijingNow = new Date(
-      now.toLocaleString("en-US", { timeZone: "Asia/Shanghai" })
-    );
-
-    // 目标时间：北京时间今天 9:00
-    const targetBeijing = new Date(
-      beijingNow.getFullYear(),
-      beijingNow.getMonth(),
-      beijingNow.getDate(),
-      9,
-      0,
-      0,
-      0
-    );
-
-    // 如果今天 9 点已过，设为明天 9 点
-    if (targetBeijing <= beijingNow) {
-      targetBeijing.setDate(targetBeijing.getDate() + 1);
+  const results = [];
+  for (const account of accounts) {
+    const result = await runCheckIn(account);
+    results.push(result);
+    console.log(result.messages.join(" | "));
+    if (!result.success) {
+      const content = buildPushMessage(results);
+      await notifyAndStop("天翼云盘签到失败", content, 1);
+      return;
     }
-
-    // 转换为 UTC 时间戳计算延迟
-    const targetUTC = new Date(
-      targetBeijing.toLocaleString("en-US", { timeZone: "UTC" })
-    );
-
-    const baseDelay = targetUTC.getTime() - now.getTime();
-    const randomExtra = randomDelay();
-    const totalDelay = baseDelay + randomExtra;
-
-    console.log(
-      `下次签到: ${targetBeijing.toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" })} + ${Math.round(randomExtra / 1000)}秒 (北京 9:00)`
-    );
-
-    setTimeout(async () => {
-      await doDailyCheckin();
-      scheduleNext();
-    }, totalDelay);
   }
 
-  // 也支持通过环境变量立即执行一次
-  if (process.env.RUN_ON_START === "1") {
-    console.log("启动时执行一次...");
-    await doDailyCheckin();
-  }
-
-  scheduleNext();
+  const content = buildPushMessage(results);
+  console.log(content);
+  push("天翼云盘签到成功", content);
+  await delay(1200);
 }
 
-main().catch((e) => {
-  console.error("守护进程异常:", e);
-  process.exit(1);
+main().catch(async (error) => {
+  const content = `签到脚本异常: ${error.message}`;
+  try {
+    push("天翼云盘签到异常", content);
+    await delay(1200);
+  } finally {
+    process.exit(1);
+  }
 });
