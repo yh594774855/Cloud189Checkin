@@ -1,0 +1,46 @@
+name: 天翼云盘签到
+
+on:
+  schedule:
+    # 北京时间 9:00 = UTC 1:00
+    - cron: '0 1 * * *'
+  workflow_dispatch:
+
+jobs:
+  checkin:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # 随机延迟 10~100 秒，分散执行避免风控
+      - name: 随机延迟
+        run: node -e "const s=Math.floor(Math.random()*91)+10;console.log('随机延迟 '+s+'s');setTimeout(()=>process.exit(),s*1000)"
+
+      # 恢复 token 缓存
+      - name: 恢复 Token 缓存
+        uses: actions/cache@v4
+        id: token-cache
+        with:
+          path: .token
+          key: cloud189-token-${{ github.run_id }}
+          restore-keys: cloud189-token-
+
+      # 写入 .env
+      - name: 写入 .env
+        run: |
+          cat > .env << 'EOF'
+          TY_USERNAME_1=${{ secrets.TY_USERNAME_1 }}
+          TY_PASSWORD_1=${{ secrets.TY_PASSWORD_1 }}
+          CLOUD189_TOKEN=${{ secrets.CLOUD189_TOKEN }}
+          SENDKEY=${{ secrets.SENDKEY }}
+          EOF
+
+      - name: 安装依赖
+        run: npm install
+
+      - name: 执行签到
+        run: npm run checkin
